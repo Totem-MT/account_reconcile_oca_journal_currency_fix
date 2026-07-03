@@ -2,7 +2,7 @@
 {
     "name": "Account Reconcile OCA: Journal Currency Fix",
     "summary": "Fix OCA bank reconciliation for foreign journals and payment tolerance",
-    "version": "16.0.1.1.0",
+    "version": "16.0.1.2.0",
     "category": "Accounting",
     "license": "AGPL-3",
     "author": "Kodea",

@@ -56,6 +56,22 @@ class AccountBankStatementLine(models.Model):
             max_amount = self._reconcile_fix_invoice_matching_max_amount(
                 line, max_amount
             )
+        if self.env.context.get("skip_oca_exchange_rate"):
+            vals_list = super(AccountBankStatementLineOca, self)._get_reconcile_line(
+                line,
+                kind,
+                is_counterpart=is_counterpart,
+                max_amount=max_amount,
+                from_unreconcile=from_unreconcile,
+                move=move,
+                is_reconciled=is_reconciled,
+            )
+            if not reconcile_auxiliary_id:
+                reconcile_auxiliary_id = 1
+            for vals in vals_list:
+                if vals.get("partner_id") is False:
+                    vals["partner_id"] = (False, self.partner_name)
+            return reconcile_auxiliary_id, vals_list
         return super()._get_reconcile_line(
             line,
             kind,
@@ -95,6 +111,23 @@ class AccountBankStatementLine(models.Model):
                 max_amount * self.amount_currency / self.amount_total_signed
             )
         return max_amount
+
+    def _oca_get_tolerance_write_off_residual(self, res, matched_lines_data):
+        """Company-currency gap between outstanding payment and bank amount applied."""
+        self.ensure_one()
+        company_currency = self.company_id.currency_id
+        applied_amount = sum(
+            abs(line["amount"])
+            for line in matched_lines_data
+            if not line.get("is_exchange_counterpart")
+        )
+        residual = 0.0
+        for aml in res.get("amls", self.env["account.move.line"]):
+            payment_residual = abs(aml.amount_residual)
+            gap = company_currency.round(payment_residual - applied_amount)
+            if company_currency.compare_amounts(gap, 0.0) > 0:
+                residual += gap
+        return residual
 
     def _oca_append_reconcile_model_write_off_lines(
         self, data, reconcile_model, residual_balance, reconcile_auxiliary_id
@@ -163,11 +196,20 @@ class AccountBankStatementLine(models.Model):
         self.ensure_one()
         amount = self._oca_get_reconcile_model_match_amount(for_auto_create)
         reconcile_model = res["model"]
+        use_tolerance_write_off = bool(
+            res.get("status") == "write_off" and reconcile_model.line_ids
+        )
+        matched_lines_data = []
+        line_env = (
+            self.with_context(skip_oca_exchange_rate=True)
+            if use_tolerance_write_off
+            else self
+        )
         for aml in res.get("amls", self.env["account.move.line"]):
             max_amount = self._oca_get_reconcile_model_max_amount(
                 aml, amount, for_auto_create=for_auto_create
             )
-            reconcile_auxiliary_id, line_data = self._get_reconcile_line(
+            reconcile_auxiliary_id, line_data = line_env._get_reconcile_line(
                 aml,
                 "other",
                 is_counterpart=True,
@@ -175,13 +217,19 @@ class AccountBankStatementLine(models.Model):
                 reconcile_auxiliary_id=reconcile_auxiliary_id,
                 move=True,
             )
-            amount -= sum(line.get("amount") for line in line_data)
+            matched_lines_data += line_data
             data += line_data
 
-        if res.get("status") == "write_off":
-            data, reconcile_auxiliary_id = self._oca_append_reconcile_model_write_off_lines(
-                data, reconcile_model, amount, reconcile_auxiliary_id
+        if use_tolerance_write_off:
+            residual = self._oca_get_tolerance_write_off_residual(
+                res, matched_lines_data
             )
+            if not self.company_id.currency_id.is_zero(residual):
+                data, reconcile_auxiliary_id = (
+                    self._oca_append_reconcile_model_write_off_lines(
+                        data, reconcile_model, residual, reconcile_auxiliary_id
+                    )
+                )
         return data, reconcile_auxiliary_id
 
     def _oca_build_liquidity_reconcile_data(self, reconcile_auxiliary_id=1):
