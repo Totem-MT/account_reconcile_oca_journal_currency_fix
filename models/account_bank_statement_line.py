@@ -112,19 +112,15 @@ class AccountBankStatementLine(models.Model):
             )
         return max_amount
 
-    def _oca_get_tolerance_write_off_residual(self, res, matched_lines_data):
-        """Company-currency gap between outstanding payment and bank amount applied."""
+    def _oca_get_tolerance_write_off_residual(self, res):
+        """Gap between outstanding payment and bank line amount (company currency)."""
         self.ensure_one()
         company_currency = self.company_id.currency_id
-        applied_amount = sum(
-            abs(line["amount"])
-            for line in matched_lines_data
-            if not line.get("is_exchange_counterpart")
-        )
+        bank_amount = abs(self.amount_total_signed)
         residual = 0.0
         for aml in res.get("amls", self.env["account.move.line"]):
             payment_residual = abs(aml.amount_residual)
-            gap = company_currency.round(payment_residual - applied_amount)
+            gap = company_currency.round(payment_residual - bank_amount)
             if company_currency.compare_amounts(gap, 0.0) > 0:
                 residual += gap
         return residual
@@ -199,16 +195,19 @@ class AccountBankStatementLine(models.Model):
         use_tolerance_write_off = bool(
             res.get("status") == "write_off" and reconcile_model.line_ids
         )
-        matched_lines_data = []
         line_env = (
             self.with_context(skip_oca_exchange_rate=True)
             if use_tolerance_write_off
             else self
         )
         for aml in res.get("amls", self.env["account.move.line"]):
-            max_amount = self._oca_get_reconcile_model_max_amount(
-                aml, amount, for_auto_create=for_auto_create
-            )
+            if use_tolerance_write_off:
+                # Apply the full outstanding payment; 626 covers bank vs payment gap.
+                max_amount = False
+            else:
+                max_amount = self._oca_get_reconcile_model_max_amount(
+                    aml, amount, for_auto_create=for_auto_create
+                )
             reconcile_auxiliary_id, line_data = line_env._get_reconcile_line(
                 aml,
                 "other",
@@ -217,13 +216,10 @@ class AccountBankStatementLine(models.Model):
                 reconcile_auxiliary_id=reconcile_auxiliary_id,
                 move=True,
             )
-            matched_lines_data += line_data
             data += line_data
 
         if use_tolerance_write_off:
-            residual = self._oca_get_tolerance_write_off_residual(
-                res, matched_lines_data
-            )
+            residual = self._oca_get_tolerance_write_off_residual(res)
             if not self.company_id.currency_id.is_zero(residual):
                 data, reconcile_auxiliary_id = (
                     self._oca_append_reconcile_model_write_off_lines(
